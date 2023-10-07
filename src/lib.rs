@@ -16,10 +16,10 @@
 //! It is not advisable to create single-implementor traits blindly.
 
 use heck::ToPascalCase;
+use itertools::Itertools;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use itertools::Itertools;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{parse_quote, parse_quote_spanned, Error, Result};
@@ -35,23 +35,24 @@ pub fn derive_trait(
 fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let attr: Attr = syn::parse2(attr)?;
     let Attr { debug_print, vis, trait_ident, supers, generics: trait_generics } = &attr;
+    let debug_print = debug_print.is_some();
     let (_, trait_generics_ref, _) = trait_generics.split_for_impl();
 
     let inherent_impl: syn::ItemImpl = syn::parse2(item)?;
 
     let mut trait_item = syn::ItemTrait {
-        attrs: Vec::new(),
-        vis: vis.clone(),
-        unsafety: None,
-        auto_token: None,
+        attrs:       Vec::new(),
+        vis:         vis.clone(),
+        unsafety:    None,
+        auto_token:  None,
         restriction: None,
         trait_token: syn::Token![trait](Span::call_site()),
-        ident: trait_ident.clone(),
-        generics: trait_generics.clone(),
+        ident:       trait_ident.clone(),
+        generics:    trait_generics.clone(),
         colon_token: supers.as_ref().map(|&(colon, _)| colon),
         supertraits: supers.clone().map(|(_, supers)| supers).unwrap_or_default(),
         brace_token: syn::token::Brace(Span::call_site()),
-        items: Vec::new(),
+        items:       Vec::new(),
     };
 
     let mut trait_impl_item = syn::ItemImpl {
@@ -78,30 +79,14 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                 let mut sig = item.sig.clone();
                 let sig_span = sig.span();
 
-                for (param_idx, input) in sig.inputs.iter_mut().enumerate() {
-                    if let syn::FnArg::Typed(arg) = input {
-                        if let syn::Type::ImplTrait(ty) = &*arg.ty {
-                            if sig.generics.lt_token.is_none() {
-                                sig.generics.lt_token = Some(syn::Token![<](sig_span));
-                                sig.generics.gt_token = Some(syn::Token![>](sig_span));
-                                sig.generics.params = Punctuated::new();
-                            }
-
-                            let ty_param_ident = syn::Ident::new(&format!("__Arg_{param_idx}"), arg.span());
-                            let bounds = &ty.bounds;
-                            sig.generics.params.push(parse_quote_spanned!(ty.impl_token.span() => #ty_param_ident: #bounds));
-                        }
-                    }
-                }
-
                 if let syn::ReturnType::Type(r_arrow, ret_ty) = &sig.output {
-                    if let syn::Type::ImplTrait(ret_ty_impl) = &**ret_ty {
-                        let span = ret_ty_impl.span();
+                    let transformed = for_each_impl_trait(ret_ty, &mut |tit| {
+                        let span = tit.span();
 
                         // convert return-position-impl-trait into associated-type-impl-trait
                         let assoc_ident = item.sig.ident.to_string().to_pascal_case();
                         let assoc_ident = syn::Ident::new(&assoc_ident, span);
-                        let ty_bounds = &ret_ty_impl.bounds;
+                        let ty_bounds = &tit.bounds;
 
                         // for now, assume all generic parameters are required.
                         // we cannot infer whether the signature involves an implicit lifetime,
@@ -117,7 +102,7 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                         } else {
                             let (sig_impl_generics, sig_ty_generics, sig_where_generics) =
                                 sig.generics.split_for_impl();
-                            let mut sig_impl_generics: syn::AngleBracketedGenericArguments =
+                            let mut sig_impl_generics: syn::Generics =
                                 syn::parse_quote!(#sig_impl_generics);
                             let mut sig_ty_generics: syn::AngleBracketedGenericArguments =
                                 syn::parse_quote!(#sig_ty_generics);
@@ -130,9 +115,9 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                                         None => {
                                             let lt: syn::Lifetime =
                                                 syn::parse_quote_spanned!(and.span() => '__self);
-                                            sig_impl_generics
-                                                .args
-                                                .push(syn::GenericArgument::Lifetime(lt.clone()));
+                                            sig_impl_generics.params.push(
+                                                syn::GenericParam::Lifetime(parse_quote!(#lt)),
+                                            );
                                             sig_ty_generics
                                                 .args
                                                 .push(syn::parse_quote_spanned!(and.span() => '_));
@@ -155,22 +140,23 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                             )
                         };
 
-                        let assoc_doc = format!("Return value for [`{fn_ident}`](Self::{fn_ident})", fn_ident = &sig.ident);
+                        let assoc_doc = format!(
+                            "Return value for [`{fn_ident}`](Self::{fn_ident})",
+                            fn_ident = &sig.ident
+                        );
                         trait_item.items.push(parse_quote_spanned! { span =>
                             #[doc = #assoc_doc]
                             type #assoc_ident #assoc_generics: #ty_bounds #assoc_where;
                         });
                         trait_impl_item.items.push(parse_quote_spanned! { span =>
-                            type #assoc_ident #assoc_generics = #ret_ty_impl #assoc_where;
+                            type #assoc_ident #assoc_generics = #tit #assoc_where;
                         });
 
-                        sig.output = syn::ReturnType::Type(
-                            *r_arrow,
-                            Box::new(parse_quote_spanned! { span =>
-                                Self::#assoc_ident #assoc_generics_names
-                            }),
-                        );
-                    }
+                        parse_quote_spanned! { span =>
+                            Self::#assoc_ident #assoc_generics_names
+                        }
+                    });
+                    sig.output = syn::ReturnType::Type(*r_arrow, Box::new(transformed));
                 }
 
                 let sig_ident = &sig.ident;
@@ -185,7 +171,8 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                     })
                     .collect();
 
-                let fn_docs: Vec<_> = item.attrs.iter().filter(|attr| attr.path().is_ident("doc")).cloned().collect();
+                let fn_docs: Vec<_> =
+                    item.attrs.iter().filter(|attr| attr.path().is_ident("doc")).cloned().collect();
 
                 trait_item.items.push(syn::TraitItem::Fn(syn::TraitItemFn {
                     attrs:      fn_docs.clone(),
@@ -207,15 +194,18 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         }
     }
 
-    let trait_item_doc = format!("Derived trait for [`{}`].", match self_ty {
-        syn::Type::Path(path) => path.path.segments.iter().map(|ident| ident.ident.to_string()).join("::"),
-        _ => quote!(#self_ty).to_string(),
-    });
+    let trait_item_doc = format!(
+        "Derived trait for [`{}`].",
+        match self_ty {
+            syn::Type::Path(path) =>
+                path.path.segments.iter().map(|ident| ident.ident.to_string()).join("::"),
+            _ => quote!(#self_ty).to_string(),
+        }
+    );
 
     let output = quote! {
         #[allow(clippy::needless_lifetimes)]
         #inherent_impl
-        #[automatically_derived]
         #[allow(clippy::needless_lifetimes, non_camel_case_types)]
         #[doc = #trait_item_doc]
         #trait_item
@@ -223,10 +213,139 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         #[allow(clippy::needless_lifetimes, non_camel_case_types)]
         #trait_impl_item
     };
-    if debug_print.is_some() {
+    if debug_print {
         println!("{}", output);
     }
     Ok(output)
+}
+
+fn for_each_impl_trait(
+    ty: &syn::Type,
+    f: &mut impl FnMut(&syn::TypeImplTrait) -> syn::Type,
+) -> syn::Type {
+    match ty {
+        syn::Type::Array(ty) => syn::Type::Array(syn::TypeArray {
+            elem: Box::new(for_each_impl_trait(&*ty.elem, f)),
+            ..ty.clone()
+        }),
+        syn::Type::BareFn(ty) => syn::Type::BareFn(syn::TypeBareFn {
+            inputs: ty
+                .inputs
+                .clone()
+                .into_pairs()
+                .map(|mut pair| {
+                    let value = pair.value_mut();
+                    value.ty = for_each_impl_trait(&value.ty, f);
+                    pair
+                })
+                .collect(),
+            ..ty.clone()
+        }),
+        syn::Type::Group(_) => ty.clone(),
+        syn::Type::ImplTrait(ty) => f(ty),
+        syn::Type::Infer(_) => ty.clone(),
+        syn::Type::Macro(_) => ty.clone(),
+        syn::Type::Never(_) => ty.clone(),
+        syn::Type::Paren(ty) => syn::Type::Paren(syn::TypeParen {
+            elem: Box::new(for_each_impl_trait(&*ty.elem, f)),
+            ..ty.clone()
+        }),
+        syn::Type::Path(ty) => syn::Type::Path(syn::TypePath {
+            qself: ty.qself.clone().map(|mut qself| {
+                qself.ty = Box::new(for_each_impl_trait(&*qself.ty, f));
+                qself
+            }),
+            path:  for_each_impl_trait_in_path(&ty.path, f),
+        }),
+        syn::Type::Ptr(ty) => syn::Type::Ptr(syn::TypePtr {
+            elem: Box::new(for_each_impl_trait(&*ty.elem, f)),
+            ..ty.clone()
+        }),
+        syn::Type::Reference(ty) => syn::Type::Reference(syn::TypeReference {
+            elem: Box::new(for_each_impl_trait(&*ty.elem, f)),
+            ..ty.clone()
+        }),
+        syn::Type::Slice(ty) => syn::Type::Slice(syn::TypeSlice {
+            elem: Box::new(for_each_impl_trait(&*ty.elem, f)),
+            ..ty.clone()
+        }),
+        syn::Type::TraitObject(ty) => syn::Type::TraitObject(syn::TypeTraitObject {
+            bounds: ty
+                .bounds
+                .clone()
+                .into_pairs()
+                .map(|mut pair| {
+                    if let syn::TypeParamBound::Trait(bound) = pair.value_mut() {
+                        bound.path = for_each_impl_trait_in_path(&bound.path, f);
+                    }
+                    pair
+                })
+                .collect(),
+            ..ty.clone()
+        }),
+        syn::Type::Tuple(ty) => syn::Type::Tuple(syn::TypeTuple {
+            elems: ty
+                .elems
+                .clone()
+                .into_pairs()
+                .map(|mut pair| {
+                    let value = pair.value_mut();
+                    *value = for_each_impl_trait(&value, f);
+                    pair
+                })
+                .collect(),
+            ..ty.clone()
+        }),
+        syn::Type::Verbatim(_) => ty.clone(),
+        _ => ty.clone(),
+    }
+}
+
+fn for_each_impl_trait_in_path(
+    path: &syn::Path,
+    f: &mut impl FnMut(&syn::TypeImplTrait) -> syn::Type,
+) -> syn::Path {
+    syn::Path {
+        leading_colon: path.leading_colon,
+        segments:      path
+            .segments
+            .clone()
+            .into_pairs()
+            .map(|mut pair| {
+                let value = pair.value_mut();
+                match &mut value.arguments {
+                    syn::PathArguments::None => {}
+                    syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments {
+                        args,
+                        ..
+                    }) => {
+                        for pair in args.pairs_mut() {
+                            match pair.into_value() {
+                                syn::GenericArgument::Type(ty) => *ty = for_each_impl_trait(ty, f),
+                                syn::GenericArgument::AssocType(ty) => {
+                                    ty.ty = for_each_impl_trait(&ty.ty, f)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    syn::PathArguments::Parenthesized(syn::ParenthesizedGenericArguments {
+                        inputs,
+                        output,
+                        ..
+                    }) => {
+                        for input in inputs {
+                            *input = for_each_impl_trait(input, f);
+                        }
+                        if let syn::ReturnType::Type(_, ty) = output {
+                            *ty = Box::new(for_each_impl_trait(ty, f));
+                        }
+                    }
+                }
+                pair
+            })
+            .collect(),
+    }
 }
 
 struct Attr {
@@ -254,7 +373,7 @@ impl Parse for Attr {
             } else if !generics.params.is_empty() && lh.peek(syn::Token![where]) {
                 generics.where_clause = Some(input.parse()?);
             } else {
-                return Err(lh.error())
+                return Err(lh.error());
             }
         }
 
