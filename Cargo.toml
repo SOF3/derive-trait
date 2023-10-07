@@ -1,0 +1,20 @@
+[package]
+name = "derive-trait"
+version = "0.0.1"
+authors = ["SOFe <sofe2038@gmail.com>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/SOF3/derive-trait"
+homepage = "https://github.com/SOF3/derive-trait"
+readme = "README.md"
+description = "Derive a trait and a delegating impl from an inherent impl block."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+heck = "0.4.1"
+itertools = "0.11.0"
+proc-macro2 = "1.0.68"
+quote = "1.0.33"
+syn = {version = "2.0.38", features = ["full"]}
