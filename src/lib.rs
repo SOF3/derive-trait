@@ -466,13 +466,8 @@ impl Parse for Attr {
             } else if lh.peek(syn::token::Brace) {
                 let inner;
                 _ = syn::braced!(inner in input);
-                let lh = inner.lookahead1();
                 while !inner.is_empty() {
-                    if lh.peek(syn::Token![type]) {
-                        fixed_assoc_types.push(inner.parse()?);
-                    } else {
-                        return Err(lh.error());
-                    }
+                    fixed_assoc_types.push(inner.parse()?);
                 }
             } else {
                 return Err(lh.error());
