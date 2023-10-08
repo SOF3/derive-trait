@@ -15,6 +15,8 @@
 //! Note that use of thsi crate is only advisable for impl blocks with complicated type bounds.
 //! It is not advisable to create single-implementor traits blindly.
 
+use std::collections::HashMap;
+
 use heck::ToPascalCase;
 use itertools::Itertools;
 use proc_macro2::{Span, TokenStream};
@@ -34,13 +36,14 @@ pub fn derive_trait(
 
 fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let attr: Attr = syn::parse2(attr)?;
-    let Attr { debug_print, vis, trait_ident, supers, generics: trait_generics } = &attr;
+    let Attr { debug_print, vis, trait_ident, supers, generics: trait_generics, fixed_assoc_types } =
+        &attr;
     let debug_print = debug_print.is_some();
     let (_, trait_generics_ref, _) = trait_generics.split_for_impl();
 
     let inherent_impl: syn::ItemImpl = syn::parse2(item)?;
 
-    let mut trait_item = syn::ItemTrait {
+    let mut item_trait = syn::ItemTrait {
         attrs:       Vec::new(),
         vis:         vis.clone(),
         unsafety:    None,
@@ -55,7 +58,7 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         items:       Vec::new(),
     };
 
-    let mut trait_impl_item = syn::ItemImpl {
+    let mut item_impl = syn::ItemImpl {
         attrs:       Vec::new(),
         unsafety:    None,
         defaultness: None,
@@ -70,6 +73,81 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         brace_token: syn::token::Brace(Span::call_site()),
         items:       Vec::new(),
     };
+
+    let mut ident_assoc_map = HashMap::new();
+
+    for assoc in fixed_assoc_types {
+        if assoc.generics.params.len() > 0 {
+            return Err(syn::Error::new_spanned(&assoc.generics, "GATs here are not supported"));
+        }
+
+        let Some((
+            eq_token,
+            default @ syn::Type::Path(syn::TypePath { qself: None, path: default_ident }),
+        )) = &assoc.default
+        else {
+            return Err(syn::Error::new_spanned(assoc, "expected `type Type: Bounds = Ident;`"));
+        };
+        let default_ident = default_ident.require_ident()?;
+
+        ident_assoc_map.insert(default_ident.clone(), assoc.ident.clone());
+
+        item_trait.items.push(syn::TraitItem::Type(syn::TraitItemType {
+            attrs:       assoc.attrs.clone(),
+            type_token:  assoc.type_token,
+            ident:       assoc.ident.clone(),
+            generics:    assoc.generics.clone(),
+            colon_token: assoc.colon_token,
+            bounds:      assoc.bounds.clone(),
+            default:     None,
+            semi_token:  assoc.semi_token,
+        }));
+
+        item_impl.items.push(syn::ImplItem::Type(syn::ImplItemType {
+            attrs:       Vec::new(),
+            vis:         syn::Visibility::Inherited,
+            defaultness: None,
+            type_token:  assoc.type_token,
+            ident:       assoc.ident.clone(),
+            generics:    assoc.generics.clone(),
+            eq_token:    *eq_token,
+            ty:          default.clone(),
+            semi_token:  assoc.semi_token,
+        }));
+    }
+
+    struct ReplaceIdentVisitor<'t>(&'t HashMap<syn::Ident, syn::Ident>);
+    impl<'t> syn::visit_mut::VisitMut for ReplaceIdentVisitor<'t> {
+        fn visit_type_path_mut(&mut self, type_path: &mut syn::TypePath) {
+            if let Some(ident) = type_path.path.segments.first() {
+                if let Some(target) = self.0.get(&ident.ident) {
+                    let mut segments: Vec<_> =
+                        type_path.path.segments.clone().into_pairs().collect();
+                    segments.insert(
+                        0,
+                        syn::punctuated::Pair::Punctuated(
+                            syn::PathSegment {
+                                ident:     syn::Ident::new("Self", ident.span()),
+                                arguments: syn::PathArguments::None,
+                            },
+                            syn::Token![::](ident.span()),
+                        ),
+                    );
+                    *segments[1].value_mut() = syn::PathSegment {
+                        ident:     target.clone(),
+                        arguments: syn::PathArguments::None,
+                    };
+                    type_path.path.segments = segments.into_iter().collect();
+                }
+            }
+
+            if let Some(qself) = &mut type_path.qself {
+                self.visit_type_mut(&mut qself.ty);
+            }
+            self.visit_path_mut(&mut type_path.path);
+        }
+    }
+    let mut replace_ident_visitor = ReplaceIdentVisitor(&ident_assoc_map);
 
     let self_ty = &*inherent_impl.self_ty;
 
@@ -144,11 +222,16 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                             "Return value for [`{fn_ident}`](Self::{fn_ident})",
                             fn_ident = &sig.ident
                         );
-                        trait_item.items.push(parse_quote_spanned! { span =>
+                        let mut trait_item_ty: syn::TraitItemType = parse_quote_spanned! { span =>
                             #[doc = #assoc_doc]
                             type #assoc_ident #assoc_generics: #ty_bounds #assoc_where;
-                        });
-                        trait_impl_item.items.push(parse_quote_spanned! { span =>
+                        };
+                        syn::visit_mut::visit_trait_item_type_mut(
+                            &mut replace_ident_visitor,
+                            &mut trait_item_ty,
+                        );
+                        item_trait.items.push(syn::TraitItem::Type(trait_item_ty));
+                        item_impl.items.push(parse_quote_spanned! { span =>
                             type #assoc_ident #assoc_generics = #tit #assoc_where;
                         });
 
@@ -174,13 +257,19 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                 let fn_docs: Vec<_> =
                     item.attrs.iter().filter(|attr| attr.path().is_ident("doc")).cloned().collect();
 
-                trait_item.items.push(syn::TraitItem::Fn(syn::TraitItemFn {
+                let mut trait_item_fn = syn::TraitItemFn {
                     attrs:      fn_docs.clone(),
                     sig:        sig.clone(),
                     default:    None,
                     semi_token: Some(syn::Token![;](item.span())),
-                }));
-                trait_impl_item.items.push(syn::ImplItem::Fn(syn::ImplItemFn {
+                };
+                syn::visit_mut::visit_trait_item_fn_mut(
+                    &mut replace_ident_visitor,
+                    &mut trait_item_fn,
+                );
+                item_trait.items.push(syn::TraitItem::Fn(trait_item_fn));
+
+                item_impl.items.push(syn::ImplItem::Fn(syn::ImplItemFn {
                     attrs:       fn_docs.clone(),
                     vis:         syn::Visibility::Inherited,
                     defaultness: None,
@@ -208,10 +297,10 @@ fn real_derive_trait(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         #inherent_impl
         #[allow(clippy::needless_lifetimes, non_camel_case_types)]
         #[doc = #trait_item_doc]
-        #trait_item
+        #item_trait
         #[automatically_derived]
         #[allow(clippy::needless_lifetimes, non_camel_case_types)]
-        #trait_impl_item
+        #item_impl
     };
     if debug_print {
         println!("{}", output);
@@ -349,11 +438,12 @@ fn for_each_impl_trait_in_path(
 }
 
 struct Attr {
-    debug_print: Option<kw::__debug_print>,
-    vis:         syn::Visibility,
-    trait_ident: syn::Ident,
-    generics:    syn::Generics,
-    supers:      Option<(syn::Token![:], Punctuated<syn::TypeParamBound, syn::Token![+]>)>,
+    debug_print:       Option<kw::__debug_print>,
+    vis:               syn::Visibility,
+    trait_ident:       syn::Ident,
+    generics:          syn::Generics,
+    supers:            Option<(syn::Token![:], Punctuated<syn::TypeParamBound, syn::Token![+]>)>,
+    fixed_assoc_types: Vec<syn::TraitItemType>,
 }
 
 impl Parse for Attr {
@@ -363,6 +453,7 @@ impl Parse for Attr {
         let trait_ident = input.parse()?;
         let mut generics = syn::Generics::default();
         let mut supers = None;
+        let mut fixed_assoc_types = Vec::new();
 
         while !input.is_empty() {
             let lh = input.lookahead1();
@@ -372,12 +463,23 @@ impl Parse for Attr {
                 supers = Some((input.parse()?, Punctuated::parse_separated_nonempty(input)?));
             } else if !generics.params.is_empty() && lh.peek(syn::Token![where]) {
                 generics.where_clause = Some(input.parse()?);
+            } else if lh.peek(syn::token::Brace) {
+                let inner;
+                _ = syn::braced!(inner in input);
+                let lh = inner.lookahead1();
+                while !inner.is_empty() {
+                    if lh.peek(syn::Token![type]) {
+                        fixed_assoc_types.push(inner.parse()?);
+                    } else {
+                        return Err(lh.error());
+                    }
+                }
             } else {
                 return Err(lh.error());
             }
         }
 
-        Ok(Self { debug_print, vis, trait_ident, supers, generics })
+        Ok(Self { debug_print, vis, trait_ident, supers, generics, fixed_assoc_types })
     }
 }
 
